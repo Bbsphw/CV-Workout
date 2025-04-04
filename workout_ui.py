@@ -22,6 +22,14 @@ class PoseDetectionApp:
         self.video_speed = 1.0
         self.is_paused = False
         self.frame_counter = 0
+        self.stop_event = threading.Event()
+        
+        # MediaPipe initialization
+        self.mp_pose = mp.solutions.pose
+        self.mp_drawing = mp.solutions.drawing_utils
+        self.pose_template = None
+        self.pose_user = None
+        self.initialize_pose_models()
 
         # Create UI
         self.create_widgets()
@@ -193,6 +201,7 @@ class PoseDetectionApp:
         self.is_running = True
         self.is_paused = False
         self.stop_event.clear()
+        self.frame_counter = 0
         
         # Start new thread
         self.processing_thread = threading.Thread(target=self.run_detection, daemon=True)
@@ -283,6 +292,7 @@ class PoseDetectionApp:
         try:
             # Open template video
             self.template_video = cv2.VideoCapture(self.template_video_path.get())
+            base_fps = self.template_video.get(cv2.CAP_PROP_FPS) or 30  # Default 30 if 0
             
             # Try to open webcam with multiple attempts
             max_attempts = 3
@@ -307,28 +317,34 @@ class PoseDetectionApp:
                     continue
                 
                 # Read frames
-                ret1, frame1 = self.template_video.read()
+                ret1, frame1 = None, None
                 ret2, frame2 = self.user_video.read()
                 
-                # Check frame reading
-                if not ret1:
-                    self.template_video.set(cv2.CAP_PROP_POS_FRAMES, 0)
-                    continue
-                    
+                # Process user frame
                 if not ret2 or frame2 is None:
                     raise RuntimeError("Cannot read frame from webcam")
                 
                 # Flip webcam frame
                 frame2 = cv2.flip(frame2, 1)
                 
-                # Check frame validity
-                if frame1 is None:
+                # Handle template video speed control
+                self.frame_counter += self.video_speed
+                frames_to_process = int(self.frame_counter)
+                self.frame_counter -= frames_to_process
+                
+                # Read template frames according to speed
+                for _ in range(max(1, frames_to_process)):  # Read at least 1 frame
+                    ret1, frame1 = self.template_video.read()
+                    if not ret1:
+                        self.template_video.set(cv2.CAP_PROP_POS_FRAMES, 0)
+                        ret1, frame1 = self.template_video.read()
+                
+                if not ret1 or frame1 is None:
                     continue
                 
                 try:
                     # Resize frames to match dimensions
-                    if frame1.shape != frame2.shape:
-                        frame2 = cv2.resize(frame2, (frame1.shape[1], frame1.shape[0]))
+                    frame2 = cv2.resize(frame2, (frame1.shape[1], frame1.shape[0]))
                     
                     # Convert colors and process poses
                     image1 = cv2.cvtColor(frame1, cv2.COLOR_BGR2RGB)
@@ -370,9 +386,11 @@ class PoseDetectionApp:
                     combined = np.hstack((frame1, frame2))
                     cv2.imshow('Pose Detection', combined)
                     
-                    # Control playback speed
-                    wait_time = max(1, int(10 / self.video_speed))
-                    if cv2.waitKey(wait_time) & 0xFF == ord('q'):
+                    # Control playback speed based on original FPS
+                    delay = int(1000 / base_fps)  # Use original template video FPS as base
+                    if delay < 1:
+                        delay = 1
+                    if cv2.waitKey(delay) & 0xFF == ord('q'):
                         break
                 
                 except Exception as e:
@@ -437,63 +455,8 @@ class PoseDetectionApp:
             self.stop_detection()
             return
         
-        # ดึง frame rate เดิมของวิดีโอต้นแบบ
-        base_fps = self.template_video.get(cv2.CAP_PROP_FPS) or 30  # Default 30 ถ้าได้ 0
-        
-        while self.is_running:
-            if self.is_paused:
-                cv2.waitKey(100)  # รอสั้นๆ เมื่อหยุดชั่วคราว
-                continue
-            
-            # อ่านเฟรมจากกล้องผู้ใช้ทุกครั้ง
-            ret2, frame2 = self.user_video.read()
-            if not ret2 or frame2 is None:
-                continue
-            
-            # จัดการความเร็วเฉพาะวิดีโอต้นแบบ
-            self.frame_counter += self.video_speed
-            frames_to_process = int(self.frame_counter)
-            self.frame_counter -= frames_to_process
-            
-            # อ่านเฟรมวิดีโอต้นแบบตามความเร็ว
-            ret1, frame1 = None, None
-            for _ in range(max(1, frames_to_process)):  # อ่านอย่างน้อย 1 เฟรม
-                ret1, frame1 = self.template_video.read()
-                if not ret1:
-                    self.template_video.set(cv2.CAP_PROP_POS_FRAMES, 0)
-                    ret1, frame1 = self.template_video.read()
-            
-            if not ret1 or frame1 is None:
-                continue
-            
-            frame2 = cv2.flip(frame2, 1)
-            frame2 = cv2.resize(frame2, (frame1.shape[1], frame1.shape[0]))
-
-            image1 = cv2.cvtColor(frame1, cv2.COLOR_BGR2RGB)
-            image2 = cv2.cvtColor(frame2, cv2.COLOR_BGR2RGB)
-            results1 = self.pose_template.process(image1)
-            results2 = self.pose_user.process(image2)
-            
-            pose1 = [[lm.x, lm.y] for lm in results1.pose_landmarks.landmark] if results1.pose_landmarks else []
-            pose2 = [[lm.x, lm.y] for lm in results2.pose_landmarks.landmark] if results2.pose_landmarks else []
-            
-            similarity = self.compare_poses(pose1, pose2) if pose1 and pose2 else 0
-            self.root.after(0, self.result_label.config, {"text": f"Pose Similarity: {similarity:.2f}%", "fg": "green" if similarity > 70 else "red"})
-            
-            self.mp_drawing.draw_landmarks(frame2, results2.pose_landmarks, self.mp_pose.POSE_CONNECTIONS)
-            cv2.putText(frame2, f'Similarity: {similarity:.2f}%', (10, 50), cv2.FONT_HERSHEY_SIMPLEX, 1, 
-                       (0, 255, 0) if similarity > 70 else (0, 0, 255), 2)
-
-            combined = np.hstack((frame1, frame2))
-            cv2.imshow('Pose Detection', combined)
-            
-            # Delay คงที่สำหรับกล้องผู้ใช้ ไม่ขึ้นกับ video_speed
-            delay = int(1000 / base_fps)  # ใช้ frame rate เดิมของวิดีโอต้นแบบเป็นฐาน
-            if delay < 1:
-                delay = 1
-            if cv2.waitKey(delay) & 0xFF == ord('q'):
-                break
-        self.stop_detection()
+        self.cleanup_resources()
+        self.root.destroy()
 
 
 def main():
